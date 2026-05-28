@@ -1,0 +1,283 @@
+name: Backend API CI/CD — Autonomous SRE
+
+on:
+  push:
+    branches: [main, "fix/*"]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  SERVICE_NAME: autonomous-sre-backend
+  CLUSTER_NAME: autonomous-sre-cluster
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  dependency-prediction:
+    name: "Stage 1 · Dependency Prediction"
+    runs-on: ubuntu-latest
+    outputs:
+      ecr_url: ${{ steps.ecr.outputs.ecr_url }}
+      safe_to_proceed: ${{ steps.predict.outputs.safe_to_proceed }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Get ECR URL from Repo 2 state
+        id: ecr
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          pip install boto3 --quiet
+          python3 - <<'PYEOF'
+          import boto3, json, os
+          try:
+              s3 = boto3.client("s3", region_name="us-east-1")
+              obj = s3.get_object(Bucket="autonomous-sre-tfstate", Key="app-infra/terraform.tfstate")
+              state = json.loads(obj["Body"].read())
+              outputs = state.get("outputs", {})
+              ecr_url = outputs.get("backend_ecr_url", {}).get("value", "")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"ecr_url={ecr_url}\n")
+          except Exception as e:
+              print(f"State read error: {e}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("ecr_url=\n")
+          PYEOF
+
+      - name: Claude dependency prediction
+        id: predict
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, urllib.request
+          ecr_url = """${{ steps.ecr.outputs.ecr_url }}""".strip()
+          safe = bool(ecr_url)
+          prompt = f"""Dependency check for repo4-backend (Python FastAPI on ECS).
+          Depends on repo2-app-infra for ECR URL. ECR URL available: {ecr_url or 'MISSING'}.
+          JSON only: {{"safe_to_proceed": {str(safe).lower()}, "risk_level": "LOW", "summary": "backend API deploy"}}"""
+          payload = json.dumps({"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]}).encode()
+          req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload,
+              headers={"Content-Type": "application/json", "x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"})
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+          text = data["content"][0]["text"].strip()
+          if "```" in text:
+              text = text.split("```")[1]
+              if text.startswith("json"): text = text[4:]
+          result = json.loads(text.strip())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"safe_to_proceed={str(result.get('safe_to_proceed', safe)).lower()}\n")
+          PYEOF
+
+  build-push:
+    name: "Stage 2 · Build & Push ECR"
+    runs-on: ubuntu-latest
+    needs: dependency-prediction
+    if: needs.dependency-prediction.outputs.safe_to_proceed != 'false'
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        id: push
+        run: |
+          ECR="${{ needs.dependency-prediction.outputs.ecr_url }}"
+          TAG="${{ github.sha }}"
+          IMAGE="${ECR}:${TAG}"
+          docker build -t "$IMAGE" .
+          docker tag "$IMAGE" "${ECR}:latest"
+          docker push "$IMAGE"
+          docker push "${ECR}:latest"
+          echo "image_uri=$IMAGE" >> $GITHUB_OUTPUT
+
+  self-heal:
+    name: "Stage 3 · Self-Heal"
+    runs-on: ubuntu-latest
+    needs: [dependency-prediction, build-push]
+    if: failure() && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Claude auto-fix
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, urllib.request
+
+          dockerfile = open("Dockerfile").read() if os.path.exists("Dockerfile") else ""
+          reqs = open("requirements.txt").read() if os.path.exists("requirements.txt") else ""
+          main_py = open("app/main.py").read() if os.path.exists("app/main.py") else ""
+
+          prompt = f"""Fix Docker build failure for Python FastAPI app on ECS.
+          Dockerfile:\n{dockerfile}\nrequirements.txt:\n{reqs}\nmain.py:\n{main_py[:1000]}
+          JSON only: {{"root_cause": "...", "fix_description": "...", "file_patches": [], "commit_message": "fix: ..."}}"""
+
+          payload = json.dumps({"model": "claude-sonnet-4-20250514", "max_tokens": 800, "messages": [{"role": "user", "content": prompt}]}).encode()
+          req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload,
+              headers={"Content-Type": "application/json", "x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"})
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+          text = data["content"][0]["text"].strip()
+          if "```" in text:
+              text = text.split("```")[1]
+              if text.startswith("json"): text = text[4:]
+          fix = json.loads(text.strip())
+          for patch in fix.get("file_patches", []):
+              fn = patch["filename"]
+              if os.path.exists(fn):
+                  with open(fn) as fp: c = fp.read()
+                  if patch.get("search", "") in c:
+                      with open(fn, "w") as fp: fp.write(c.replace(patch["search"], patch["replace"], 1))
+          with open("/tmp/commit_msg.txt", "w") as fp: fp.write(fix.get("commit_message", "fix: auto-heal backend"))
+          with open("/tmp/root_cause.txt", "w") as fp: fp.write(fix.get("root_cause", "unknown"))
+          PYEOF
+
+          BRANCH="fix/auto-heal-backend-$(date +%Y%m%d-%H%M%S)"
+          git config user.name "Autonomous SRE Bot"
+          git config user.email "sre-bot@autonomous-sre.io"
+          git checkout -b "$BRANCH"
+          git add -A
+          git diff --staged --quiet || git commit -m "$(cat /tmp/commit_msg.txt)"
+          git push origin "$BRANCH"
+          gh pr create --title "🤖 Auto-heal backend: $(cat /tmp/commit_msg.txt)" \
+            --body "Root cause: $(cat /tmp/root_cause.txt)" \
+            --head "$BRANCH" --base main --label "auto-heal" || true
+
+  deploy:
+    name: "Stage 4 · Deploy to ECS"
+    runs-on: ubuntu-latest
+    needs: [build-push]
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      deploy_status: ${{ steps.deploy.outputs.status }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy ECS service
+        id: deploy
+        run: |
+          aws ecs update-service --cluster "$CLUSTER_NAME" --service "$SERVICE_NAME" --force-new-deployment
+          set +e
+          aws ecs wait services-stable --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME"
+          CODE=$?
+          echo "status=$([ $CODE -eq 0 ] && echo success || echo failed)" >> $GITHUB_OUTPUT
+          exit $CODE
+
+  war-room:
+    name: "Stage 5 · War Room"
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure() && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Multi-Agent War Room — Backend
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pip install boto3 --quiet
+          python3 - <<'PYEOF'
+          import os, json, boto3, urllib.request, datetime
+
+          ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+          CLUSTER = os.environ.get("CLUSTER_NAME", "autonomous-sre-cluster")
+          SERVICE = os.environ.get("SERVICE_NAME", "autonomous-sre-backend")
+
+          def claude(messages, system="You are an expert SRE.", max_tokens=800):
+              payload = json.dumps({"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens, "system": system, "messages": messages}).encode()
+              req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload,
+                  headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"})
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read())["content"][0]["text"]
+
+          print("\n🚨 WAR ROOM: backend-api deployment failure")
+
+          # Fetch ECS task data
+          ecs_info = "No ECS data"
+          try:
+              ecs = boto3.client("ecs", region_name="us-east-1")
+              tasks = ecs.list_tasks(cluster=CLUSTER, serviceName=SERVICE, desiredStatus="STOPPED")
+              if tasks["taskArns"]:
+                  desc = ecs.describe_tasks(cluster=CLUSTER, tasks=tasks["taskArns"][:1])
+                  containers = desc["tasks"][0].get("containers", [])
+                  ecs_info = json.dumps([{"name": c["name"], "exit": c.get("exitCode"), "reason": c.get("reason", "")} for c in containers])
+          except Exception as e:
+              ecs_info = f"ECS fetch error: {e}"
+
+          # Agent 1: Log analysis
+          log_report = claude([{"role": "user", "content": f"ECS backend container failed. Container data: {ecs_info}. Diagnose in 100 words max. Common Python issues: import errors, port binding, missing env vars."}], system="ECS log analyst.")
+          print(f"[Log Analyst]: {log_report}")
+
+          # Agent 2: Blast radius
+          blast = claude([{"role": "user", "content": f"Backend API failed on ECS. Frontend still running but /api/* calls will 502. Assess impact in 80 words. Log: {log_report[:300]}"}], system="Blast radius estimator.")
+          print(f"[Blast Radius]: {blast}")
+
+          # Agent 3: Orchestrator decision
+          decision_raw = claude([{"role": "user", "content": f"War room orchestrator. Log: {log_report}. Blast: {blast}. Action: ROLLBACK|REDEPLOY|HOTFIX_PR. JSON only: {{\"action\":\"ROLLBACK\",\"reason\":\"...\",\"hotfix_needed\":false}}"}], system="War room orchestrator.")
+          print(f"[Orchestrator]: {decision_raw}")
+
+          try:
+              clean = decision_raw.strip()
+              if "```" in clean:
+                  clean = clean.split("```")[1]
+                  if clean.startswith("json"): clean = clean[4:]
+              decision = json.loads(clean.strip())
+          except:
+              decision = {"action": "ROLLBACK", "reason": "parse error"}
+
+          # Execute
+          action = decision.get("action", "ROLLBACK")
+          ecs_client = boto3.client("ecs", region_name="us-east-1")
+          if action == "ROLLBACK":
+              try:
+                  svc = ecs_client.describe_services(cluster=CLUSTER, services=[SERVICE])["services"][0]
+                  td = svc["taskDefinition"]
+                  family = td.rsplit(":", 1)[0].split("/")[-1]
+                  rev = int(td.rsplit(":", 1)[1])
+                  if rev > 1:
+                      ecs_client.update_service(cluster=CLUSTER, service=SERVICE, taskDefinition=f"{family}:{rev-1}")
+                      print(f"Rolled back to revision {rev-1}")
+              except Exception as e:
+                  print(f"Rollback error: {e}")
+          elif action == "REDEPLOY":
+              ecs_client.update_service(cluster=CLUSTER, service=SERVICE, forceNewDeployment=True)
+              print("Redeployment triggered")
+
+          print(f"\nWar room complete. Action: {action}")
+          PYEOF
+
+      - name: Create incident issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "🚨 Incident: Backend deployment failure $(date +%Y-%m-%d)" \
+            --body "Auto-created by Autonomous SRE war room. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --label "incident,auto-heal" || true
